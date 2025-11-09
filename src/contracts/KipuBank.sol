@@ -15,6 +15,8 @@ import {
 } from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
+import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
+import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
 
 contract KipuBank is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20Metadata;
@@ -23,7 +25,8 @@ contract KipuBank is AccessControl, ReentrancyGuard {
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
     bytes32 public constant ADMIN_ROLE = DEFAULT_ADMIN_ROLE;
-
+    address public constant USDC_ADDRESS =
+        0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     /// Errors
     error ZeroAmount();
     error DepositExceedsBankCap(uint256 capUsd6, uint256 attemptedUsd6);
@@ -42,7 +45,10 @@ contract KipuBank is AccessControl, ReentrancyGuard {
     error InvalidPriceFeed();
     error UnsupportedToken();
 
-    IUniswapV2Router02 public immutable uniswapRouter;
+    error SlippageTooHigh(uint256 estimatedUsdc, uint256 minOut);
+
+    IUniswapV2Router02 public immutable i_uniswapRouter;
+    IUniswapV2Factory public immutable i_uniswapFactory;
     /// Events
     event Deposit(
         address indexed token,
@@ -72,7 +78,7 @@ contract KipuBank is AccessControl, ReentrancyGuard {
     uint256 public s_totalUsdStored6; // current total value in USD6
     uint256 public s_maxWithdrawUsd6; // global withdraw limit in USD6 (0 -> disabled)
 
-    /// Balances[token][user] = raw token units (wei for ETH)
+    // I only need to track eth balances, and usdc balances
     mapping(address => mapping(address => uint256)) private s_balances;
 
     /// Counters
@@ -94,6 +100,19 @@ contract KipuBank is AccessControl, ReentrancyGuard {
         i_ethUsdPriceFeed = AggregatorV3Interface(ethUsdPriceFeed);
         s_bankCapUsd6 = bankCapUsd6;
         s_maxWithdrawUsd6 = maxWithdrawUsd6;
+        // mainnet address: 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D
+        // sepoila address: 0xeE567Fe1712Faf6149d80dA1E6934E354124CfE3
+        i_uniswapRouter = IUniswapV2Router02(
+            0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D
+        ); // Uniswap V2 Router
+        // mainnet address: 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f
+        // sepoila address: 0xF62c03E08ada871A0bEb309762E260a7a6a880E6
+        i_uniswapFactory = IUniswapV2Factory(
+            0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f
+        ); // Uniswap V2 Factory.
+        s_totalUsdStored6 = 0;
+        s_totalDeposits = 0;
+        s_totalWithdrawals = 0;
     }
 
     // -----------------------------
@@ -139,45 +158,126 @@ contract KipuBank is AccessControl, ReentrancyGuard {
         emit Deposit(NATIVE_TOKEN, sender, amount, usd6);
     }
 
+    function _depositUSDC(address sender, uint256 amount) internal {
+        if (amount == 0) revert ZeroAmount();
+
+        uint256 usd6 = amount; // USDC is already in 6 decimals
+        uint256 newTotalUsd6 = s_totalUsdStored6 + usd6;
+
+        if (newTotalUsd6 > s_bankCapUsd6)
+            revert DepositExceedsBankCap(s_bankCapUsd6, newTotalUsd6);
+
+        s_balances[USDC_ADDRESS][sender] += amount; // USDC token address
+        s_totalUsdStored6 = newTotalUsd6;
+
+        unchecked {
+            s_totalDeposits++;
+        }
+
+        emit Deposit(USDC_ADDRESS, sender, amount, usd6);
+    }
+
     /// @notice Deposit native ETH into sender vault
     function depositETH() external payable nonReentrant {
         _depositETH(msg.sender, msg.value);
     }
 
+    function depositUSDC() external payable nonReentrant {
+        _depositUSDC(msg.sender, msg.value);
+    }
+
+    function _getPathForTokenToUsd6(
+        address token
+    ) internal view returns (address[] memory) {
+        address[] memory path;
+
+        address pairAddress = i_uniswapFactory.getPair(token, USDC_ADDRESS);
+        if (pairAddress == address(0)) {
+            pairAddress = i_uniswapFactory.getPair(
+                token,
+                i_uniswapRouter.WETH()
+            );
+            if (pairAddress == address(0)) revert UnsupportedToken();
+            path = new address[](3);
+            path[0] = token;
+            path[1] = i_uniswapRouter.WETH();
+            path[2] = USDC_ADDRESS;
+            return path;
+        }
+        path = new address[](2);
+        path[0] = token;
+        path[1] = USDC_ADDRESS;
+        return path;
+    }
+    /// @notice Deposit ERC20 token into sender vault (token must implement decimals())
     /// @notice Deposit ERC20 token into sender vault (token must implement decimals())
     /// @dev Compute USD value and check cap BEFORE pulling tokens to avoid returning them.
-    function depositToken(address token, uint256 amount) external nonReentrant {
+    function depositToken(
+        address token,
+        uint256 amount,
+        uint256 minOut
+    ) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
+
         if (token == NATIVE_TOKEN) {
             _depositETH(msg.sender, amount);
             return;
         }
+        if (token == USDC_ADDRESS) {
+            _depositUSDC(msg.sender, amount);
+            return;
+        }
 
-        uint256 usd6 = _toUsd6(token, amount);
-        uint256 newTotalUsd6 = s_totalUsdStored6 + usd6;
+        address[] memory path = _getPathForTokenToUsd6(token);
+
+        // Estimate output
+        uint256[] memory amountsOut = i_uniswapRouter.getAmountsOut(
+            amount,
+            path
+        );
+        uint256 expectedOut = amountsOut[amountsOut.length - 1];
+
+        if (expectedOut < minOut) revert SlippageTooHigh(expectedOut, minOut);
+
+        uint256 newTotalUsd6 = s_totalUsdStored6 + expectedOut;
         if (newTotalUsd6 > s_bankCapUsd6)
             revert DepositExceedsBankCap(s_bankCapUsd6, newTotalUsd6);
 
-        // pull tokens after cap check
+        // Pull tokens and approve router
         IERC20Metadata(token).safeTransferFrom(
             msg.sender,
             address(this),
             amount
         );
+        IERC20Metadata(token).safeIncreaseAllowance(
+            address(i_uniswapRouter),
+            amount
+        );
 
-        // effects
-        s_balances[token][msg.sender] += amount;
-        s_totalUsdStored6 = newTotalUsd6;
+        // Swap to USDC
+        uint[] memory amounts = i_uniswapRouter.swapExactTokensForTokens(
+            amount,
+            minOut,
+            path,
+            address(this),
+            block.timestamp
+        );
+
+        uint256 usdcReceived = amounts[amounts.length - 1];
+
+        // Update balances
+        uint256 newTotalUsd6Final = s_totalUsdStored6 + usdcReceived;
+        if (newTotalUsd6Final > s_bankCapUsd6)
+            revert DepositExceedsBankCap(s_bankCapUsd6, newTotalUsd6Final);
+
+        s_balances[USDC_ADDRESS][msg.sender] += usdcReceived;
+        s_totalUsdStored6 = newTotalUsd6Final;
         unchecked {
             s_totalDeposits++;
         }
 
-        emit Deposit(token, msg.sender, amount, usd6);
+        emit Deposit(token, msg.sender, amount, usdcReceived);
     }
-
-    // -----------------------------
-    // Withdrawals (Option A: global USD limit applied)
-    // -----------------------------
 
     /// @notice Withdraw native ETH
     function withdrawETH(uint256 amount) external nonReentrant {
@@ -207,6 +307,34 @@ contract KipuBank is AccessControl, ReentrancyGuard {
         if (!success) revert NativeTransferFailed(msg.sender, amount);
 
         emit Withdrawal(NATIVE_TOKEN, msg.sender, amount, usd6);
+    }
+
+    function withdrawUSDC(uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        uint256 userBal = s_balances[USDC_ADDRESS][msg.sender];
+        if (userBal < amount)
+            revert InsufficientBalance(
+                USDC_ADDRESS,
+                msg.sender,
+                userBal,
+                amount
+            );
+
+        uint256 usd6 = amount; // USDC is already in 6 decimals
+        if (s_maxWithdrawUsd6 > 0 && usd6 > s_maxWithdrawUsd6)
+            revert WithdrawExceedsPerTx(USDC_ADDRESS, s_maxWithdrawUsd6, usd6);
+
+        // effects
+        s_balances[USDC_ADDRESS][msg.sender] = userBal - amount;
+        s_totalUsdStored6 = s_totalUsdStored6 - usd6;
+        unchecked {
+            s_totalWithdrawals++;
+        }
+
+        // interaction
+        IERC20Metadata(USDC_ADDRESS).safeTransfer(msg.sender, amount);
+
+        emit Withdrawal(USDC_ADDRESS, msg.sender, amount, usd6);
     }
 
     /// @notice Withdraw ERC20 token
@@ -287,7 +415,12 @@ contract KipuBank is AccessControl, ReentrancyGuard {
         uint256 usd6 = (scaled * (10 ** uint256(USDC_DECIMALS))) / denom;
         return usd6;
     }
-
+    function getTotalUsdStored6() external view returns (uint256) {
+        return s_totalUsdStored6;
+    }
+    function getMaxWithdrawUsd6() external view returns (uint256) {
+        return s_maxWithdrawUsd6;
+    }
     // -----------------------------
     // Fallback / receive
     // -----------------------------
